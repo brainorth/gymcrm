@@ -98,10 +98,15 @@ export async function requireTenant(
   gymSlug: string,
   permission: Permission,
 ): Promise<TenantContext> {
-  const session = await getCurrentSession();
+  const [session, gymOrError] = await Promise.all([
+    getCurrentSession(),
+    requireGymBySlug(gymSlug).catch(
+      (err: unknown): ResolvedGym | Error => (err instanceof Error ? err : new Error(String(err))),
+    ),
+  ]);
   if (!session) throw new UnauthenticatedError();
-
-  const gym = await requireGymBySlug(gymSlug);
+  if (gymOrError instanceof Error) throw gymOrError;
+  const gym = gymOrError;
   const user = session.user;
   const isSuperAdmin = user.platformRole === "SUPER_ADMIN";
   const membership = user.memberships.find((m) => m.gymId === gym.id);
