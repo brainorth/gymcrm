@@ -6,6 +6,7 @@ import Link from "next/link";
 import { useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Loader2, LogIn } from "lucide-react";
+import type { z } from "zod";
 import { loginSchema, type LoginInput } from "@/server/auth/schemas";
 import { login } from "@/server/auth/actions";
 import { Button } from "@/components/ui/button";
@@ -20,7 +21,7 @@ export function LoginForm({ next }: { next?: string }) {
     handleSubmit,
     setError,
     formState: { errors, isSubmitting },
-  } = useForm<LoginInput>({
+  } = useForm<z.input<typeof loginSchema>, unknown, LoginInput>({
     resolver: zodResolver(loginSchema),
     defaultValues: { email: "", password: "", next },
   });
@@ -66,7 +67,7 @@ export function LoginForm({ next }: { next?: string }) {
           {...register("password")}
         />
       </Field>
-      <input type="hidden" {...register("next")} />
+      {next ? <input type="hidden" {...register("next")} /> : null}
       <Button type="submit" className="w-full" disabled={isSubmitting}>
         {isSubmitting ? <Loader2 className="h-4 w-4 animate-spin" /> : <LogIn className="h-4 w-4" />}
         Sign in

@@ -42,7 +42,11 @@ export const currencySchema = z.string().length(3).toUpperCase().default("INR");
 export const loginSchema = z.object({
   email: emailSchema,
   password: z.string().min(1, "Enter your password.").max(200),
-  next: z.string().startsWith("/").max(300).optional(),
+  next: z
+    .string()
+    .max(300)
+    .optional()
+    .transform((v) => (v && v.startsWith("/") && !v.startsWith("//") ? v : undefined)),
 });
 export type LoginInput = z.infer<typeof loginSchema>;
 
