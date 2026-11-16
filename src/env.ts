@@ -41,14 +41,6 @@ const serverEnvSchema = z.object({
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
   CRON_SECRET: z.string().optional(),
 }).superRefine((data, ctx) => {
-  if (data.NODE_ENV === "production" && data.PAYMENTS_DRIVER === "mock") {
-    ctx.addIssue({
-      code: "custom",
-      path: ["PAYMENTS_DRIVER"],
-      message: "PAYMENTS_DRIVER cannot be 'mock' in production.",
-    });
-  }
-
   if (data.STORAGE_DRIVER === "supabase") {
     if (!data.SUPABASE_URL?.trim()) {
       ctx.addIssue({
