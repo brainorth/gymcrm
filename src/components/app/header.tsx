@@ -1,4 +1,5 @@
 import { Badge } from "@/components/ui/card";
+import { TenantNav } from "./tenant-nav";
 import { UserMenu } from "./user-menu";
 import type { SessionMembership } from "@/server/auth/session";
 
@@ -34,6 +35,7 @@ export function AppHeader({
           }))}
         />
       </div>
+      {currentSlug && role !== "MEMBER" ? <TenantNav gymSlug={currentSlug} role={role} /> : null}
     </header>
   );
 }

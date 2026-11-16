@@ -1,6 +1,7 @@
 import { redirect } from "next/navigation";
 import { CalendarClock, QrCode, UserRound } from "lucide-react";
 import { AppHeader } from "@/components/app/header";
+import { MemberCheckinCard } from "@/components/portal/member-checkin-card";
 import { Alert, Badge, Card, CardDescription, CardTitle } from "@/components/ui/card";
 import { requireTenant } from "@/server/auth/rbac";
 import { ForbiddenError, UnauthenticatedError } from "@/server/db/errors";
@@ -111,8 +112,9 @@ export default async function MemberPortalPage({
               <CardDescription className="mt-1">
                 {checkedIn
                   ? `Checked in at ${checkedIn.checkInTime.toLocaleTimeString("en-IN", { timeZone: ctx.gym.timezone, hour: "2-digit", minute: "2-digit" })}`
-                  : "Not checked in yet. Scan the code at the front desk."}
+                  : "Not checked in yet. Enter the 6-character code from the front desk."}
               </CardDescription>
+              {!checkedIn ? <MemberCheckinCard gymSlug={ctx.gym.slug} /> : null}
             </Card>
           </>
         )}
