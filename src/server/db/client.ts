@@ -36,13 +36,21 @@ const globalForPrisma = globalThis as unknown as {
   __gymPrisma?: PrismaClient;
 };
 
-/** Singleton across Next.js dev HMR reloads. */
-export const prisma: PrismaClient =
-  globalForPrisma.__gymPrisma ?? build(env().DATABASE_URL);
-
-if (process.env.NODE_ENV !== "production") {
-  globalForPrisma.__gymPrisma = prisma;
+function getPrisma(): PrismaClient {
+  if (globalForPrisma.__gymPrisma) return globalForPrisma.__gymPrisma;
+  const client = build(env().DATABASE_URL);
+  globalForPrisma.__gymPrisma = client;
+  return client;
 }
+
+/** Lazy singleton across Next.js dev HMR reloads; never reads env() at build time. */
+export const prisma: PrismaClient = new Proxy({} as PrismaClient, {
+  get(_target, prop, receiver) {
+    const client = getPrisma();
+    const value = Reflect.get(client, prop, receiver);
+    return typeof value === "function" ? value.bind(client) : value;
+  },
+});
 
 /** Test harness helper: a disposable client pointed at the test database. */
 export function createIsolatedPrismaClient(connectionString: string): PrismaClient {
