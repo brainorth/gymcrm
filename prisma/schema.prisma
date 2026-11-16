@@ -1,0 +1,684 @@
+// ---------------------------------------------------------------------------
+// Gym SaaS — multi-tenant schema (single Postgres / shared schema, Supabase)
+//
+// HARD RULES (see docs/DECISIONS.md):
+//  1. Every tenant-owned table carries `gymId` AND `@@unique([id, gymId])`.
+//  2. Every tenant-owned child references its parent with a COMPOSITE FK
+//     (`[parentId, gymId] -> [id, gymId]`), so the database itself rejects a
+//     write that mixes two gyms. This is the backstop behind the app guard.
+//  3. Money is ALWAYS an integer in minor units (paise/cents) + `currency`.
+//  4. Dates that a human thinks about (start/end/local attendance day) are
+//     `@db.Date` in the GYM'S timezone. Instants are `DateTime` (timestamptz).
+//  5. Membership status is DERIVED from dates + freezes, never hand-flipped.
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+// ============================ ENUMS =======================================
+
+/// Platform-level power. Tenant roles live on GymMembership, NOT on User.
+enum PlatformRole {
+  NONE
+  SUPER_ADMIN
+}
+
+enum GymRole {
+  GYM_OWNER
+  STAFF
+  TRAINER
+  MEMBER
+}
+
+enum GymStatus {
+  ACTIVE
+  SUSPENDED
+  ARCHIVED
+}
+
+/// Denormalised onto Gym so middleware can gate a tenant without a join.
+enum BillingStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  UNPAID
+}
+
+enum SaasInterval {
+  MONTH
+  YEAR
+}
+
+enum SaasSubscriptionStatus {
+  TRIALING
+  ACTIVE
+  PAST_DUE
+  CANCELLED
+  EXPIRED
+}
+
+/// Administrative state of the person, controlled by the gym.
+/// Whether their *membership* is live is derived from MemberSubscription.
+enum MemberStatus {
+  ACTIVE
+  INACTIVE
+  ARCHIVED
+}
+
+enum SubscriptionStatus {
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  CASH
+  CARD
+  UPI
+  ONLINE
+  BANK_TRANSFER
+  OTHER
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCEEDED
+  FAILED
+  REFUNDED
+}
+
+enum PaymentProvider {
+  MANUAL
+  RAZORPAY
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PAID
+  VOID
+}
+
+enum PaymentLinkStatus {
+  CREATED
+  PAID
+  EXPIRED
+  CANCELLED
+}
+
+enum AttendanceSource {
+  MEMBER_QR
+  STAFF_SCAN
+  MANUAL
+}
+
+enum TokenPurpose {
+  EMAIL_VERIFICATION
+  PASSWORD_RESET
+  MEMBER_INVITE
+  STAFF_INVITE
+}
+
+enum NotificationChannel {
+  EMAIL
+  WHATSAPP
+  SMS
+}
+
+enum NotificationStatus {
+  PENDING
+  SENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSED
+  FAILED
+  IGNORED
+}
+
+// ============================ IDENTITY ====================================
+
+/// Global identity. One row per human, reusable across gyms.
+/// `email` is the login credential; `phone` is optional and not unique.
+model User {
+  id             String       @id @default(cuid())
+  email          String       @unique
+  emailVerifiedAt DateTime?
+  name           String
+  phone          String?
+  passwordHash   String? // null => invited, has not set a password yet
+  platformRole   PlatformRole @default(NONE)
+  isActive       Boolean      @default(true)
+  lastLoginAt    DateTime?
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  memberships    GymMembership[]
+  sessions       Session[]
+  tokens         VerificationToken[]
+  ownedGyms      Gym[]               @relation("GymOwner")
+  memberProfiles MemberProfile[]
+  auditLogs      AuditLog[]
+  recordedPayments Payment[]         @relation("PaymentRecordedBy")
+}
+
+/// THE role table. A user can be a MEMBER at gym A and a TRAINER at gym B.
+/// Authorization is always (userId, gymId) -> role. Never trust a global role.
+model GymMembership {
+  id        String   @id @default(cuid())
+  userId    String
+  gymId     String
+  role      GymRole
+  isActive  Boolean  @default(true)
+  invitedBy String?
+  joinedAt  DateTime @default(now())
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+  gym  Gym  @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, gymId])
+  @@unique([id, gymId])
+  @@index([gymId, role])
+}
+
+/// Server-side sessions => instant revocation, per-device logout, tenant switch.
+/// We store only an HMAC of the opaque cookie token, never the token itself.
+model Session {
+  id          String    @id @default(cuid())
+  userId      String
+  tokenHash   String    @unique
+  activeGymId String? // last selected tenant; RE-VERIFIED on every request
+  expiresAt   DateTime
+  revokedAt   DateTime?
+  lastSeenAt  DateTime  @default(now())
+  ip          String?
+  userAgent   String?
+  createdAt   DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([expiresAt])
+}
+
+model VerificationToken {
+  id         String       @id @default(cuid())
+  purpose    TokenPurpose
+  tokenHash  String       @unique
+  email      String
+  userId     String?
+  gymId      String?
+  payload    Json?
+  expiresAt  DateTime
+  consumedAt DateTime?
+  createdAt  DateTime     @default(now())
+
+  user User? @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([email, purpose])
+  @@index([expiresAt])
+}
+
+/// DB-backed throttle so rate limits survive serverless cold starts.
+model AuthThrottle {
+  key             String    @id // "login:email:<hash>" | "login:ip:<ip>"
+  hits            Int       @default(0)
+  windowStartedAt DateTime  @default(now())
+  lockedUntil     DateTime?
+  updatedAt       DateTime  @updatedAt
+}
+
+// ============================ TENANT ======================================
+
+model Gym {
+  id        String      @id @default(cuid())
+  name      String
+  slug      String      @unique
+  logoKey   String? // storage object key, served via signed URL
+  status    GymStatus   @default(ACTIVE)
+  ownerId   String
+  timezone  String      @default("Asia/Kolkata") // IANA; drives all local dates
+  currency  String      @default("INR") @db.VarChar(3)
+  phone     String?
+  addressLine String?
+  city      String?
+  /// Maintained by the billing service; middleware reads this, not the join.
+  billingStatus BillingStatus @default(TRIALING)
+  trialEndsAt   DateTime?
+  /// HMAC secret for rotating attendance QR tokens (never exposed to clients).
+  qrSecret          String
+  qrRotationSeconds Int     @default(30)
+  allowMultipleCheckInsPerDay Boolean @default(false)
+  requireActiveSubscription   Boolean @default(true)
+  waiverVersion String  @default("v1")
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  owner User @relation("GymOwner", fields: [ownerId], references: [id], onDelete: Restrict)
+
+  memberships         GymMembership[]
+  memberProfiles      MemberProfile[]
+  plans               Plan[]
+  subscriptions       MemberSubscription[]
+  freezes             SubscriptionFreeze[]
+  payments            Payment[]
+  paymentLinks        PaymentLink[]
+  invoices            Invoice[]
+  invoiceItems        InvoiceItem[]
+  invoiceCounters     InvoiceCounter[]
+  attendance          Attendance[]
+  auditLogs           AuditLog[]
+  notifications       NotificationOutbox[]
+  saasSubscription    SaasSubscription?
+
+  @@index([status])
+}
+
+model MemberProfile {
+  id     String @id @default(cuid())
+  gymId  String
+  /// null until the person claims their account (walk-in onboarding is normal).
+  userId String?
+  memberCode String // human-facing, unique per gym (e.g. GOLD-000123)
+  fullName String
+  phone    String
+  email    String?
+  dateOfBirth DateTime? @db.Date
+  gender   String?
+  /// Private storage keys — NOT public URLs. Render with signed URLs only.
+  photoKey   String?
+  idProofKey String?
+  idProofType String?
+  emergencyContactName  String?
+  emergencyContactPhone String?
+  emergencyContactRelation String?
+  waiverAcceptedAt DateTime?
+  waiverVersion    String?
+  waiverSignatureKey String?
+  status    MemberStatus @default(ACTIVE)
+  notes     String?
+  joinedAt  DateTime     @default(now())
+  createdAt DateTime     @default(now())
+  updatedAt DateTime     @updatedAt
+  archivedAt DateTime?
+
+  gym  Gym   @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  user User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  // Composite parents: children must reference (id, gymId).
+  subscriptions MemberSubscription[] @relation("SubMember")
+  payments      Payment[]            @relation("PaymentMember")
+  attendance    Attendance[]         @relation("AttendanceMember")
+  invoices      Invoice[]            @relation("InvoiceMember")
+  paymentLinks  PaymentLink[]        @relation("LinkMember")
+
+  @@unique([id, gymId])
+  @@unique([gymId, memberCode])
+  @@unique([gymId, userId])
+  @@index([gymId, status])
+  @@index([gymId, phone])
+  @@index([gymId, fullName])
+}
+
+model Plan {
+  id    String @id @default(cuid())
+  gymId String
+  name  String
+  description String?
+  durationInDays Int
+  priceMinor     Int // minor units, e.g. 150000 = ₹1,500.00
+  currency       String @default("INR") @db.VarChar(3)
+  joiningFeeMinor Int   @default(0)
+  maxFreezeDays  Int    @default(0) // 0 => freezing not allowed on this plan
+  graceDays      Int    @default(0) // late-renewal window after effective end
+  isActive  Boolean @default(true)
+  sortOrder Int     @default(0)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  deletedAt DateTime?
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  subscriptions MemberSubscription[] @relation("SubPlan")
+
+  @@unique([id, gymId])
+  @@unique([gymId, name])
+  @@index([gymId, isActive])
+}
+
+model MemberSubscription {
+  id       String @id @default(cuid())
+  gymId    String
+  memberId String
+  planId   String
+  /// Local calendar dates in gym.timezone. `endDate` is the paid-through day.
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  /// endDate + total frozen days. Maintained transactionally by the freeze
+  /// service so "expiring in 7 days" stays a single indexed range query.
+  effectiveEndDate DateTime @db.Date
+  status     SubscriptionStatus @default(ACTIVE)
+  priceMinor Int
+  currency   String @default("INR") @db.VarChar(3)
+  freezeDaysUsed Int @default(0)
+  cancelledAt DateTime?
+  cancelReason String?
+  notes String?
+  createdById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym  Gym           @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member MemberProfile @relation("SubMember", fields: [memberId, gymId], references: [id, gymId], onDelete: Restrict)
+  plan   Plan          @relation("SubPlan", fields: [planId, gymId], references: [id, gymId], onDelete: Restrict)
+
+  payments Payment[]
+  invoices Invoice[]
+  paymentLinks PaymentLink[]
+  attendance Attendance[]
+  freezes SubscriptionFreeze[] @relation("FreezeSub")
+
+  @@unique([id, gymId])
+  @@index([gymId, memberId, status])
+  @@index([gymId, effectiveEndDate])
+  @@index([gymId, status, effectiveEndDate])
+}
+
+/// Freezing is a range, not a flag. Ongoing freeze => endDate null.
+model SubscriptionFreeze {
+  id             String @id @default(cuid())
+  gymId          String
+  subscriptionId String
+  startDate DateTime @db.Date
+  endDate   DateTime? @db.Date
+  days      Int? // set when the freeze closes
+  reason    String?
+  createdById String?
+  resumedById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  subscription MemberSubscription @relation("FreezeSub", fields: [subscriptionId, gymId], references: [id, gymId], onDelete: Cascade)
+
+  @@unique([id, gymId])
+  @@index([gymId, subscriptionId])
+  @@index([gymId, endDate])
+}
+
+// ============================ MONEY =======================================
+
+model Invoice {
+  id       String @id @default(cuid())
+  gymId    String
+  memberId String
+  subscriptionId String?
+  /// Gapless per gym + fiscal year, allocated from InvoiceCounter under a row lock.
+  number   String
+  sequence Int
+  fiscalYear String // "2026-27"
+  status   InvoiceStatus @default(ISSUED)
+  currency String @default("INR") @db.VarChar(3)
+  subtotalMinor Int
+  discountMinor Int @default(0)
+  taxMinor      Int @default(0)
+  totalMinor    Int
+  paidMinor     Int @default(0)
+  issuedAt DateTime @default(now())
+  dueAt    DateTime?
+  voidedAt DateTime?
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym  Gym           @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member MemberProfile @relation("InvoiceMember", fields: [memberId, gymId], references: [id, gymId], onDelete: Restrict)
+  subscription MemberSubscription? @relation(fields: [subscriptionId, gymId], references: [id, gymId], onDelete: Restrict)
+
+  items    InvoiceItem[]
+  payments Payment[]
+
+  @@unique([id, gymId])
+  @@unique([gymId, fiscalYear, sequence])
+  @@unique([gymId, number])
+  @@index([gymId, memberId])
+  @@index([gymId, status, dueAt])
+}
+
+model InvoiceItem {
+  id        String @id @default(cuid())
+  gymId     String
+  invoiceId String
+  label     String
+  quantity  Int    @default(1)
+  unitPriceMinor Int
+  totalMinor     Int
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  invoice Invoice @relation(fields: [invoiceId, gymId], references: [id, gymId], onDelete: Cascade)
+
+  @@unique([id, gymId])
+  @@index([gymId, invoiceId])
+}
+
+/// One row per (gym, fiscal year). Locked with SELECT ... FOR UPDATE when
+/// allocating an invoice number. Never use count()+1.
+model InvoiceCounter {
+  id         String @id @default(cuid())
+  gymId      String
+  fiscalYear String
+  lastSequence Int  @default(0)
+  prefix     String @default("INV")
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@unique([gymId, fiscalYear])
+}
+
+model Payment {
+  id       String @id @default(cuid())
+  gymId    String
+  memberId String
+  subscriptionId String?
+  invoiceId String?
+  amountMinor Int
+  currency String @default("INR") @db.VarChar(3)
+  method   PaymentMethod
+  status   PaymentStatus @default(SUCCEEDED)
+  provider PaymentProvider @default(MANUAL)
+  /// Razorpay wiring (inert until PAYMENTS_DRIVER=razorpay)
+  providerOrderId   String?
+  providerPaymentId String?
+  providerSignature String?
+  providerTransferId String? // Razorpay Route transfer to the gym's linked account
+  failureReason String?
+  /// Required for online writes; makes retries safe.
+  idempotencyKey String?
+  refundedMinor Int @default(0)
+  paymentDate DateTime @default(now())
+  recordedById String?
+  notes String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym  Gym           @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member MemberProfile @relation("PaymentMember", fields: [memberId, gymId], references: [id, gymId], onDelete: Restrict)
+  subscription MemberSubscription? @relation(fields: [subscriptionId, gymId], references: [id, gymId], onDelete: Restrict)
+  invoice Invoice? @relation(fields: [invoiceId, gymId], references: [id, gymId], onDelete: Restrict)
+  recordedBy User? @relation("PaymentRecordedBy", fields: [recordedById], references: [id], onDelete: SetNull)
+
+  @@unique([id, gymId])
+  @@unique([gymId, idempotencyKey])
+  @@unique([provider, providerPaymentId])
+  @@index([gymId, paymentDate])
+  @@index([gymId, memberId])
+  @@index([gymId, status])
+}
+
+model PaymentLink {
+  id       String @id @default(cuid())
+  gymId    String
+  memberId String
+  subscriptionId String?
+  amountMinor Int
+  currency String @default("INR") @db.VarChar(3)
+  provider PaymentProvider @default(RAZORPAY)
+  providerLinkId String?
+  shortCode String @unique // /pay/<shortCode>
+  status PaymentLinkStatus @default(CREATED)
+  expiresAt DateTime?
+  paidAt DateTime?
+  createdById String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym Gym @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member MemberProfile @relation("LinkMember", fields: [memberId, gymId], references: [id, gymId], onDelete: Restrict)
+  subscription MemberSubscription? @relation(fields: [subscriptionId, gymId], references: [id, gymId], onDelete: Restrict)
+
+  @@unique([id, gymId])
+  @@index([gymId, status])
+}
+
+// ============================ ATTENDANCE ==================================
+
+model Attendance {
+  id       String @id @default(cuid())
+  gymId    String
+  memberId String
+  subscriptionId String?
+  checkInTime  DateTime // instant (timestamptz)
+  checkOutTime DateTime?
+  /// Local calendar day in gym.timezone — the dedupe key.
+  localDate DateTime @db.Date
+  source    AttendanceSource @default(MEMBER_QR)
+  verifiedByUserId String?
+  deviceId String?
+  createdAt DateTime @default(now())
+
+  gym  Gym           @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  member MemberProfile @relation("AttendanceMember", fields: [memberId, gymId], references: [id, gymId], onDelete: Restrict)
+  subscription MemberSubscription? @relation(fields: [subscriptionId, gymId], references: [id, gymId], onDelete: Restrict)
+
+  @@unique([id, gymId])
+  @@unique([gymId, memberId, localDate])
+  @@index([gymId, localDate])
+}
+
+// ============================ PLATFORM BILLING ============================
+
+model SaasPlan {
+  id       String @id @default(cuid())
+  code     String @unique // starter | pro | chain
+  name     String
+  interval SaasInterval @default(MONTH)
+  priceMinor Int
+  currency String @default("INR") @db.VarChar(3)
+  maxMembers Int?
+  maxStaff   Int?
+  features Json?
+  isActive Boolean @default(true)
+  sortOrder Int @default(0)
+  createdAt DateTime @default(now())
+
+  subscriptions SaasSubscription[]
+}
+
+model SaasSubscription {
+  id     String @id @default(cuid())
+  gymId  String @unique
+  planId String
+  status SaasSubscriptionStatus @default(TRIALING)
+  provider PaymentProvider @default(RAZORPAY)
+  providerSubscriptionId String?
+  providerCustomerId String?
+  currentPeriodStart DateTime?
+  currentPeriodEnd   DateTime?
+  trialEndsAt DateTime?
+  cancelledAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym  Gym      @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  plan SaasPlan @relation(fields: [planId], references: [id], onDelete: Restrict)
+
+  @@index([status, currentPeriodEnd])
+}
+
+// ============================ OPS =========================================
+
+model AuditLog {
+  id       String  @id @default(cuid())
+  gymId    String? // null => platform action
+  actorUserId String?
+  actorRole String?
+  action   String // "member.create", "payment.record", "impersonate.start"
+  entityType String
+  entityId String?
+  before Json?
+  after  Json?
+  ip String?
+  userAgent String?
+  createdAt DateTime @default(now())
+
+  gym Gym? @relation(fields: [gymId], references: [id], onDelete: Cascade)
+  actor User? @relation(fields: [actorUserId], references: [id], onDelete: SetNull)
+
+  @@index([gymId, createdAt])
+  @@index([gymId, entityType, entityId])
+}
+
+/// Transactional outbox: write intent in the same transaction as the business
+/// change, deliver from a worker/cron with retries. Never fan out inline.
+model NotificationOutbox {
+  id       String @id @default(cuid())
+  gymId    String?
+  channel  NotificationChannel
+  template String // "membership.expiring_3d"
+  recipient String
+  payload  Json
+  status   NotificationStatus @default(PENDING)
+  dedupeKey String @unique
+  attempts Int @default(0)
+  lastError String?
+  scheduledFor DateTime @default(now())
+  sentAt DateTime?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  gym Gym? @relation(fields: [gymId], references: [id], onDelete: Cascade)
+
+  @@index([status, scheduledFor])
+  @@index([gymId, createdAt])
+}
+
+/// Webhook inbox: unique (provider, eventId) makes redelivery a no-op.
+model WebhookEvent {
+  id       String @id @default(cuid())
+  provider PaymentProvider
+  eventId  String
+  eventType String
+  payload  Json
+  signatureValid Boolean @default(false)
+  status   WebhookStatus @default(RECEIVED)
+  attempts Int @default(0)
+  lastError String?
+  receivedAt DateTime @default(now())
+  processedAt DateTime?
+
+  @@unique([provider, eventId])
+  @@index([status, receivedAt])
+}
