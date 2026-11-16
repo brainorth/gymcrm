@@ -2,7 +2,7 @@ import type { BillingStatus, GymStatus, SaasInterval, SaasSubscriptionStatus } f
 import { auditInContext, writeAudit } from "@/server/audit/log";
 import type { TenantContext } from "@/server/auth/rbac";
 import { prisma } from "@/server/db/client";
-import { NotFoundError } from "@/server/db/errors";
+import { NotFoundError, ValidationFailedError } from "@/server/db/errors";
 
 export type SaasPlanDTO = {
   id: string;
@@ -145,6 +145,10 @@ export async function selectSaasPlan(
 
   if (!plan || !plan.isActive) {
     throw new NotFoundError("SaaS plan");
+  }
+
+  if (plan.priceMinor > 0 && ctx.role !== "SUPER_ADMIN") {
+    throw new ValidationFailedError("Paid plan upgrades require payment confirmation.");
   }
 
   const now = new Date();

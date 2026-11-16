@@ -14,7 +14,8 @@ export default async function PublicPayPage({
   const link = await getPublicPaymentLink(shortCode);
   if (!link) notFound();
 
-  const isMockMode = env().PAYMENTS_DRIVER === "mock";
+  const config = env();
+  const isMockMode = config.NODE_ENV !== "production" && config.PAYMENTS_DRIVER === "mock";
 
   return (
     <main className="flex min-h-screen items-center justify-center bg-background px-4 py-12">

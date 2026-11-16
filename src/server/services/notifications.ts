@@ -158,6 +158,17 @@ export async function drainNotificationOutbox(limit = 50): Promise<{
   failed: number;
 }> {
   const now = new Date();
+  const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000);
+
+  await prisma.notificationOutbox.updateMany({
+    where: {
+      status: "SENDING",
+      updatedAt: { lt: fiveMinutesAgo },
+      attempts: { lt: MAX_ATTEMPTS },
+    },
+    data: { status: "PENDING" },
+  });
+
   const candidates = await prisma.notificationOutbox.findMany({
     where: {
       status: "PENDING",

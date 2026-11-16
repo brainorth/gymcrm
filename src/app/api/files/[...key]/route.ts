@@ -25,6 +25,14 @@ export async function GET(
       return NextResponse.json({ error: "Invalid file key." }, { status: 400 });
     }
 
+    const gym = await prisma.gym.findUnique({
+      where: { id: gymId },
+      select: { id: true, status: true, deletedAt: true },
+    });
+    if (!gym || gym.deletedAt || gym.status !== "ACTIVE") {
+      return NextResponse.json({ error: "Gym is not active." }, { status: 403 });
+    }
+
     const isSuperAdmin = session.user.platformRole === "SUPER_ADMIN";
     if (!isSuperAdmin) {
       const membership = session.user.memberships.find((m) => m.gymId === gymId);
@@ -53,6 +61,8 @@ export async function GET(
       status: 200,
       headers: {
         "Content-Type": contentType,
+        "Content-Disposition": "attachment",
+        "Content-Security-Policy": "default-src 'none'; sandbox",
         "Cache-Control": "private, no-store",
         "X-Content-Type-Options": "nosniff",
       },

@@ -3,7 +3,7 @@ import { fiscalYearFor, toInputValue } from "@/lib/dates";
 import { toMinorUnits } from "@/lib/money";
 import { auditInContext } from "@/server/audit/log";
 import type { TenantContext } from "@/server/auth/rbac";
-import { NotFoundError, ValidationFailedError } from "@/server/db/errors";
+import { NotFoundError, ValidationFailedError, isUniqueViolation } from "@/server/db/errors";
 
 export type PaymentDTO = {
   id: string;
@@ -101,35 +101,51 @@ export async function refundPayment(
     });
   }
 
-  const existing = (await ctx.db.payment.findFirst({
-    where: { id: paymentId },
-    select: PAYMENT_SELECT,
-  })) as unknown as PaymentRow | null;
-  if (!existing) throw new NotFoundError("Payment");
+  const { existing, updated } = await ctx.db.$transaction(async (tx) => {
+    const existingRow = (await tx.payment.findFirst({
+      where: { id: paymentId },
+      select: PAYMENT_SELECT,
+    })) as unknown as PaymentRow | null;
+    if (!existingRow) throw new NotFoundError("Payment");
 
-  if (existing.status !== "SUCCEEDED") {
-    throw new ValidationFailedError("Only succeeded payments can be refunded.");
-  }
+    if (existingRow.status !== "SUCCEEDED") {
+      throw new ValidationFailedError("Only succeeded payments can be refunded.");
+    }
 
-  const remainingMinor = existing.amountMinor - existing.refundedMinor;
-  if (amountMinor > remainingMinor) {
-    throw new ValidationFailedError("Refund amount exceeds remaining refundable balance.", {
-      amountMajor: ["Amount exceeds remaining refundable balance."],
+    const remainingMinor = existingRow.amountMinor - existingRow.refundedMinor;
+    if (amountMinor > remainingMinor) {
+      throw new ValidationFailedError("Refund amount exceeds remaining refundable balance.", {
+        amountMajor: ["Amount exceeds remaining refundable balance."],
+      });
+    }
+
+    const nextRefundedMinor = existingRow.refundedMinor + amountMinor;
+    const nextStatus: PaymentStatus =
+      nextRefundedMinor >= existingRow.amountMinor ? "REFUNDED" : "SUCCEEDED";
+
+    const { count } = await tx.payment.updateMany({
+      where: {
+        id: paymentId,
+        status: "SUCCEEDED",
+        refundedMinor: existingRow.refundedMinor,
+      },
+      data: {
+        refundedMinor: nextRefundedMinor,
+        status: nextStatus,
+      },
     });
-  }
+    if (count !== 1) {
+      throw new ValidationFailedError("Refund conflicted with another update. Please retry.");
+    }
 
-  const nextRefundedMinor = existing.refundedMinor + amountMinor;
-  const nextStatus: PaymentStatus =
-    nextRefundedMinor >= existing.amountMinor ? "REFUNDED" : "SUCCEEDED";
+    const updatedRow = (await tx.payment.findFirst({
+      where: { id: paymentId },
+      select: PAYMENT_SELECT,
+    })) as unknown as PaymentRow | null;
+    if (!updatedRow) throw new NotFoundError("Payment");
 
-  const updated = (await ctx.db.payment.update({
-    where: { id: paymentId },
-    data: {
-      refundedMinor: nextRefundedMinor,
-      status: nextStatus,
-    },
-    select: PAYMENT_SELECT,
-  })) as unknown as PaymentRow;
+    return { existing: existingRow, updated: updatedRow };
+  });
 
   const dto = toDTO(updated);
   await auditInContext({
@@ -154,75 +170,99 @@ export async function issueInvoiceForPayment(
   ctx: TenantContext,
   paymentId: string,
 ): Promise<PaymentDTO> {
-  const result = await ctx.db.$transaction(async (tx) => {
-    const payment = (await tx.payment.findFirst({
-      where: { id: paymentId },
-      select: PAYMENT_SELECT,
-    })) as unknown as PaymentRow | null;
-    if (!payment) throw new NotFoundError("Payment");
+  let result: { row: PaymentRow; createdInvoiceNumber: string | null } | null = null;
 
-    if (payment.invoiceId) {
-      return { row: payment, createdInvoiceNumber: null as string | null };
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      result = await ctx.db.$transaction(async (tx) => {
+        const payment = (await tx.payment.findFirst({
+          where: { id: paymentId },
+          select: PAYMENT_SELECT,
+        })) as unknown as PaymentRow | null;
+        if (!payment) throw new NotFoundError("Payment");
+
+        if (payment.invoiceId) {
+          return { row: payment, createdInvoiceNumber: null as string | null };
+        }
+
+        const now = new Date();
+        const fiscalYear = fiscalYearFor(now);
+
+        const counter = await tx.invoiceCounter.upsert({
+          where: { gymId_fiscalYear: { gymId: ctx.gym.id, fiscalYear } },
+          create: {
+            fiscalYear,
+            lastSequence: 1,
+          } as never,
+          update: {
+            lastSequence: { increment: 1 },
+          },
+          select: { lastSequence: true, prefix: true },
+        });
+
+        const invoiceNumber = `${counter.prefix}-${fiscalYear}-${String(counter.lastSequence).padStart(4, "0")}`;
+
+        const invoice = await tx.invoice.create({
+          data: {
+            memberId: payment.memberId,
+            subscriptionId: payment.subscriptionId,
+            number: invoiceNumber,
+            sequence: counter.lastSequence,
+            fiscalYear,
+            status: "ISSUED",
+            currency: payment.currency,
+            subtotalMinor: payment.amountMinor,
+            totalMinor: payment.amountMinor,
+            paidMinor: payment.amountMinor,
+            issuedAt: now,
+            notes: payment.notes,
+          } as never,
+          select: { id: true, number: true },
+        });
+
+        const itemLabel = payment.subscription?.plan.name
+          ? `${payment.subscription.plan.name} membership`
+          : "Gym payment";
+
+        await tx.invoiceItem.create({
+          data: {
+            invoiceId: invoice.id,
+            label: itemLabel,
+            quantity: 1,
+            unitPriceMinor: payment.amountMinor,
+            totalMinor: payment.amountMinor,
+          } as never,
+          select: { id: true },
+        });
+
+        const linked = await tx.payment.updateMany({
+          where: { id: payment.id, invoiceId: null },
+          data: { invoiceId: invoice.id },
+        });
+        if (linked.count !== 1) {
+          throw new ValidationFailedError("Invoice already issued for this payment.");
+        }
+
+        const updated = (await tx.payment.findFirst({
+          where: { id: payment.id },
+          select: PAYMENT_SELECT,
+        })) as unknown as PaymentRow | null;
+        if (!updated) throw new NotFoundError("Payment");
+
+        return { row: updated, createdInvoiceNumber: invoice.number };
+      });
+      break;
+    } catch (error) {
+      if (attempt < 2 && isUniqueViolation(error)) {
+        continue;
+      }
+      throw error;
     }
+  }
 
-    const now = new Date();
-    const fiscalYear = fiscalYearFor(now);
-
-    const counter = await tx.invoiceCounter.upsert({
-      where: { gymId_fiscalYear: { gymId: ctx.gym.id, fiscalYear } },
-      create: {
-        fiscalYear,
-        lastSequence: 1,
-      } as never,
-      update: {
-        lastSequence: { increment: 1 },
-      },
-      select: { lastSequence: true, prefix: true },
-    });
-
-    const invoiceNumber = `${counter.prefix}-${fiscalYear}-${String(counter.lastSequence).padStart(4, "0")}`;
-
-    const invoice = await tx.invoice.create({
-      data: {
-        memberId: payment.memberId,
-        subscriptionId: payment.subscriptionId,
-        number: invoiceNumber,
-        sequence: counter.lastSequence,
-        fiscalYear,
-        status: "ISSUED",
-        currency: payment.currency,
-        subtotalMinor: payment.amountMinor,
-        totalMinor: payment.amountMinor,
-        paidMinor: payment.amountMinor,
-        issuedAt: now,
-        notes: payment.notes,
-      } as never,
-      select: { id: true, number: true },
-    });
-
-    const itemLabel = payment.subscription?.plan.name
-      ? `${payment.subscription.plan.name} membership`
-      : "Gym payment";
-
-    await tx.invoiceItem.create({
-      data: {
-        invoiceId: invoice.id,
-        label: itemLabel,
-        quantity: 1,
-        unitPriceMinor: payment.amountMinor,
-        totalMinor: payment.amountMinor,
-      } as never,
-      select: { id: true },
-    });
-
-    const updated = (await tx.payment.update({
-      where: { id: payment.id },
-      data: { invoiceId: invoice.id },
-      select: PAYMENT_SELECT,
-    })) as unknown as PaymentRow;
-
-    return { row: updated, createdInvoiceNumber: invoice.number };
-  });
+  if (!result) {
+    throw new ValidationFailedError("Could not issue invoice. Please retry.");
+  }
 
   const dto = toDTO(result.row);
   if (result.createdInvoiceNumber) {

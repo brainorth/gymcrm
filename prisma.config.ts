@@ -9,13 +9,7 @@ import { defineConfig } from "prisma/config";
  *   DIRECT_URL   -> direct / session pooler (:5432) -> used for migrations
  * Migrations take advisory locks and run DDL, which transaction pooling breaks.
  */
-const migrationUrl = process.env.DIRECT_URL ?? process.env.DATABASE_URL;
-
-if (!migrationUrl) {
-  throw new Error(
-    "Set DIRECT_URL (preferred) or DATABASE_URL in .env before running Prisma CLI commands.",
-  );
-}
+const migrationUrl = process.env.DIRECT_URL || process.env.DATABASE_URL;
 
 export default defineConfig({
   schema: "prisma/schema.prisma",
@@ -23,9 +17,13 @@ export default defineConfig({
     path: "prisma/migrations",
     seed: "tsx prisma/seed.ts",
   },
-  datasource: {
-    url: migrationUrl,
-    // Only needed if your role cannot CREATE DATABASE (Supabase pooled roles):
-    // shadowDatabaseUrl: process.env.SHADOW_DATABASE_URL,
-  },
+  ...(migrationUrl
+    ? {
+        datasource: {
+          url: migrationUrl,
+          // Only needed if your role cannot CREATE DATABASE (Supabase pooled roles):
+          // shadowDatabaseUrl: process.env.SHADOW_DATABASE_URL,
+        },
+      }
+    : {}),
 });

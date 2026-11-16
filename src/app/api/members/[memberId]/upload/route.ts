@@ -2,25 +2,14 @@ import { NextResponse } from "next/server";
 import { auditInContext } from "@/server/audit/log";
 import { withTenant } from "@/server/auth/rbac";
 import { AppError, NotFoundError, ValidationFailedError } from "@/server/db/errors";
-import { isPrivateFileKind, savePrivateFile, type PrivateFileKind } from "@/server/storage/files";
+import {
+  isPrivateFileKind,
+  savePrivateFile,
+  validateUploadFile,
+  type PrivateFileKind,
+} from "@/server/storage/files";
 
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024; // 10 MiB
-
-const EXT_BY_MIME: Record<string, string> = {
-  "image/jpeg": "jpg",
-  "image/png": "png",
-  "image/webp": "webp",
-  "image/gif": "gif",
-  "application/pdf": "pdf",
-};
-
-function resolveFileExtension(file: File): string {
-  const fromMime = EXT_BY_MIME[file.type.toLowerCase()];
-  if (fromMime) return fromMime;
-  const namePart = file.name.split(".").pop()?.trim().toLowerCase() ?? "";
-  if (/^[a-z0-9]{1,10}$/.test(namePart)) return namePart;
-  return "bin";
-}
 
 function updateDataForKind(kind: PrivateFileKind, key: string) {
   switch (kind) {
@@ -77,13 +66,14 @@ export async function POST(
       }
 
       const bytes = new Uint8Array(await file.arrayBuffer());
+      const { contentType, ext } = validateUploadFile(file.type, bytes);
       const { key } = await savePrivateFile({
         gymId: ctx.gym.id,
         memberId: member.id,
         kind,
         bytes,
-        contentType: file.type || "application/octet-stream",
-        ext: resolveFileExtension(file),
+        contentType,
+        ext,
       });
 
       await ctx.db.memberProfile.update({

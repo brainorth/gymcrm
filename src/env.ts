@@ -40,6 +40,55 @@ const serverEnvSchema = z.object({
   WHATSAPP_TOKEN: z.string().optional(),
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
   CRON_SECRET: z.string().optional(),
+}).superRefine((data, ctx) => {
+  if (data.NODE_ENV === "production" && data.PAYMENTS_DRIVER === "mock") {
+    ctx.addIssue({
+      code: "custom",
+      path: ["PAYMENTS_DRIVER"],
+      message: "PAYMENTS_DRIVER cannot be 'mock' in production.",
+    });
+  }
+
+  if (data.STORAGE_DRIVER === "supabase") {
+    if (!data.SUPABASE_URL?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["SUPABASE_URL"],
+        message: "SUPABASE_URL is required when STORAGE_DRIVER is 'supabase'.",
+      });
+    }
+    if (!data.SUPABASE_SERVICE_ROLE_KEY?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["SUPABASE_SERVICE_ROLE_KEY"],
+        message: "SUPABASE_SERVICE_ROLE_KEY is required when STORAGE_DRIVER is 'supabase'.",
+      });
+    }
+  }
+
+  if (data.PAYMENTS_DRIVER === "razorpay") {
+    if (!data.RAZORPAY_KEY_ID?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["RAZORPAY_KEY_ID"],
+        message: "RAZORPAY_KEY_ID is required when PAYMENTS_DRIVER is 'razorpay'.",
+      });
+    }
+    if (!data.RAZORPAY_KEY_SECRET?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["RAZORPAY_KEY_SECRET"],
+        message: "RAZORPAY_KEY_SECRET is required when PAYMENTS_DRIVER is 'razorpay'.",
+      });
+    }
+    if (!data.RAZORPAY_WEBHOOK_SECRET?.trim()) {
+      ctx.addIssue({
+        code: "custom",
+        path: ["RAZORPAY_WEBHOOK_SECRET"],
+        message: "RAZORPAY_WEBHOOK_SECRET is required when PAYMENTS_DRIVER is 'razorpay'.",
+      });
+    }
+  }
 });
 
 export type ServerEnv = z.infer<typeof serverEnvSchema>;

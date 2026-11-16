@@ -142,6 +142,23 @@ function scopeCreateData(
   return stamp(data);
 }
 
+function assertUpdateScope(
+  data: unknown,
+  meta: TenantModelMeta,
+  gymId: string,
+  model: string,
+  operation: string,
+): void {
+  if (!isPlainObject(data)) return;
+  const col = meta.scope;
+  if (data[col] !== undefined && data[col] !== gymId) {
+    throw new TenantScopeError(
+      `${model}.${operation} tried to write ${col}=${JSON.stringify(data[col])} inside gym ${gymId}`,
+      { model, operation, attempted: data[col], gymId },
+    );
+  }
+}
+
 /** Rule 5 — selections may not walk into platform tables. */
 function assertSelectionAllowed(
   selection: unknown,
@@ -198,10 +215,12 @@ function guardArgs(
     case "update":
     case "updateMany":
     case "updateManyAndReturn":
+      assertUpdateScope(a.data, meta, gymId, model, operation);
       assertNoNestedWrites(a.data, meta, model);
       break;
     case "upsert":
       a.create = scopeCreateData(a.create, meta, gymId, model);
+      assertUpdateScope(a.update, meta, gymId, model, operation);
       assertNoNestedWrites(a.update, meta, model, "update");
       break;
     default:

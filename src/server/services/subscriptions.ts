@@ -218,6 +218,7 @@ export async function freezeSubscription(
       select: {
         id: true,
         status: true,
+        effectiveEndDate: true,
         freezeDaysUsed: true,
         plan: { select: { maxFreezeDays: true } },
         freezes: { where: { endDate: null }, select: { id: true } },
@@ -226,6 +227,9 @@ export async function freezeSubscription(
     if (!sub) throw new NotFoundError("Subscription");
     if (sub.status !== "ACTIVE") {
       throw new ValidationFailedError("Only active subscriptions can be frozen.");
+    }
+    if (sub.effectiveEndDate < today) {
+      throw new ValidationFailedError("Expired subscriptions cannot be frozen.");
     }
     if (sub.plan.maxFreezeDays <= 0) {
       throw new ValidationFailedError("This plan does not allow freezing.");
@@ -274,6 +278,7 @@ export async function resumeSubscription(
       where: { id: subscriptionId },
       select: {
         id: true,
+        status: true,
         effectiveEndDate: true,
         freezeDaysUsed: true,
         plan: { select: { maxFreezeDays: true } },
@@ -281,6 +286,9 @@ export async function resumeSubscription(
       },
     });
     if (!sub) throw new NotFoundError("Subscription");
+    if (sub.status !== "ACTIVE") {
+      throw new ValidationFailedError("Only active subscriptions can be resumed.");
+    }
     const openFreeze = sub.freezes[0];
     if (!openFreeze) {
       throw new ValidationFailedError("This subscription is not currently frozen.");
@@ -369,6 +377,14 @@ export async function recordManualPayment(
     select: { id: true },
   });
   if (!member) throw new NotFoundError("Member");
+
+  if (input.subscriptionId) {
+    const subscription = await ctx.db.memberSubscription.findFirst({
+      where: { id: input.subscriptionId, memberId: member.id },
+      select: { id: true },
+    });
+    if (!subscription) throw new NotFoundError("Subscription");
+  }
 
   const payment = await ctx.db.payment.create({
     data: {

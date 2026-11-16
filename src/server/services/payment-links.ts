@@ -176,13 +176,14 @@ export async function getPublicPaymentLink(
 }
 
 /**
- * Completes a payment link in mock mode. Disabled when `PAYMENTS_DRIVER !== "mock"`.
+ * Completes a payment link in mock mode. Disabled in production or when `PAYMENTS_DRIVER !== "mock"`.
  */
 export async function completeMockPaymentLink(
   shortCode: string,
 ): Promise<CompleteMockPaymentResult> {
-  if (env().PAYMENTS_DRIVER !== "mock") {
-    throw new ForbiddenError("Mock payments are disabled when live payments are active.");
+  const config = env();
+  if (config.NODE_ENV === "production" || config.PAYMENTS_DRIVER !== "mock") {
+    throw new ForbiddenError("Mock payments are disabled.");
   }
 
   const txResult = await prisma.$transaction(async (tx) => {
@@ -310,7 +311,6 @@ type RazorpayWebhookPayload = {
 export async function processRazorpayWebhook(
   rawBody: string,
   signature: string,
-  eventIdHeader?: string,
 ): Promise<WebhookProcessResult> {
   if (!verifyRazorpayWebhookSignature(rawBody, signature)) {
     throw new ForbiddenError("Invalid Razorpay webhook signature.");
@@ -327,58 +327,66 @@ export async function processRazorpayWebhook(
   const paymentEntity = parsed.payload?.payment?.entity;
   const linkEntity = parsed.payload?.payment_link?.entity;
 
-  const fallbackDigest = createHash("sha256").update(rawBody).digest("hex").slice(0, 16);
   const eventId =
-    eventIdHeader?.trim() ||
-    parsed.id ||
-    `${eventType}:${paymentEntity?.id ?? linkEntity?.id ?? fallbackDigest}`;
-
-  const existing = await prisma.webhookEvent.findUnique({
-    where: { provider_eventId: { provider: "RAZORPAY", eventId } },
-    select: { id: true, status: true },
-  });
-
-  if (existing?.status === "PROCESSED") {
-    return { status: "ALREADY_PROCESSED", eventId, eventType };
-  }
-
-  const webhookRecord = await prisma.webhookEvent.upsert({
-    where: { provider_eventId: { provider: "RAZORPAY", eventId } },
-    create: {
-      provider: "RAZORPAY",
-      eventId,
-      eventType,
-      payload: parsed as never,
-      signatureValid: true,
-      status: "RECEIVED",
-      attempts: 1,
-    },
-    update: {
-      eventType,
-      payload: parsed as never,
-      signatureValid: true,
-      status: "RECEIVED",
-      attempts: { increment: 1 },
-      lastError: null,
-    },
-    select: { id: true },
-  });
+    parsed.id?.trim() || createHash("sha256").update(rawBody).digest("hex");
 
   try {
-    if (eventType !== "payment.captured" && eventType !== "payment_link.paid") {
-      await prisma.webhookEvent.update({
-        where: { id: webhookRecord.id },
-        data: { status: "IGNORED", processedAt: new Date() },
+    return await prisma.$transaction(async (tx) => {
+      const existing = await tx.webhookEvent.findUnique({
+        where: { provider_eventId: { provider: "RAZORPAY", eventId } },
+        select: { id: true, status: true },
       });
-      return { status: "IGNORED", eventId, eventType };
-    }
 
-    const notes = {
-      ...(linkEntity?.notes ?? {}),
-      ...(paymentEntity?.notes ?? {}),
-    };
+      if (existing?.status === "PROCESSED") {
+        return { status: "ALREADY_PROCESSED" as const, eventId, eventType };
+      }
 
-    await prisma.$transaction(async (tx) => {
+      let webhookRecordId: string;
+      if (existing) {
+        const claimed = await tx.webhookEvent.updateMany({
+          where: { id: existing.id, status: { not: "PROCESSED" } },
+          data: {
+            eventType,
+            payload: parsed as never,
+            signatureValid: true,
+            status: "RECEIVED",
+            attempts: { increment: 1 },
+            lastError: null,
+          },
+        });
+        if (claimed.count !== 1) {
+          return { status: "ALREADY_PROCESSED" as const, eventId, eventType };
+        }
+        webhookRecordId = existing.id;
+      } else {
+        const created = await tx.webhookEvent.create({
+          data: {
+            provider: "RAZORPAY",
+            eventId,
+            eventType,
+            payload: parsed as never,
+            signatureValid: true,
+            status: "RECEIVED",
+            attempts: 1,
+          },
+          select: { id: true },
+        });
+        webhookRecordId = created.id;
+      }
+
+      if (eventType !== "payment.captured" && eventType !== "payment_link.paid") {
+        await tx.webhookEvent.update({
+          where: { id: webhookRecordId },
+          data: { status: "IGNORED", processedAt: new Date() },
+        });
+        return { status: "IGNORED" as const, eventId, eventType };
+      }
+
+      const notes = {
+        ...(linkEntity?.notes ?? {}),
+        ...(paymentEntity?.notes ?? {}),
+      };
+
       const link = await findMatchingPaymentLink(tx, {
         providerLinkId: linkEntity?.id,
         paymentLinkId: notes.paymentLinkId,
@@ -386,19 +394,24 @@ export async function processRazorpayWebhook(
       });
 
       const now = new Date();
-      if (link && link.status !== "PAID") {
-        await tx.paymentLink.update({
-          where: { id: link.id },
-          data: { status: "PAID", paidAt: now },
-        });
-      }
-
       const gymId = link?.gymId ?? notes.gymId;
       const memberId = link?.memberId ?? notes.memberId;
       const subscriptionId = link?.subscriptionId ?? notes.subscriptionId ?? null;
       const amountMinor =
         paymentEntity?.amount ?? linkEntity?.amount_paid ?? link?.amountMinor ?? 0;
       const currency = paymentEntity?.currency ?? linkEntity?.currency ?? link?.currency ?? "INR";
+
+      if (link && link.status !== "PAID") {
+        if (amountMinor < link.amountMinor || currency !== link.currency) {
+          throw new ValidationFailedError(
+            "Webhook payment amount or currency does not match payment link.",
+          );
+        }
+        await tx.paymentLink.update({
+          where: { id: link.id },
+          data: { status: "PAID", paidAt: now },
+        });
+      }
 
       if (gymId && memberId && amountMinor > 0) {
         const providerPaymentId = paymentEntity?.id ?? null;
@@ -444,18 +457,29 @@ export async function processRazorpayWebhook(
       }
 
       await tx.webhookEvent.update({
-        where: { id: webhookRecord.id },
+        where: { id: webhookRecordId },
         data: { status: "PROCESSED", processedAt: now, lastError: null },
       });
-    });
 
-    return { status: "PROCESSED", eventId, eventType };
+      return { status: "PROCESSED" as const, eventId, eventType };
+    });
   } catch (error) {
-    await prisma.webhookEvent.update({
-      where: { id: webhookRecord.id },
-      data: {
+    const lastError = error instanceof Error ? error.message.slice(0, 500) : "Unknown error";
+    await prisma.webhookEvent.upsert({
+      where: { provider_eventId: { provider: "RAZORPAY", eventId } },
+      create: {
+        provider: "RAZORPAY",
+        eventId,
+        eventType,
+        payload: parsed as never,
+        signatureValid: true,
         status: "FAILED",
-        lastError: error instanceof Error ? error.message.slice(0, 500) : "Unknown error",
+        attempts: 1,
+        lastError,
+      },
+      update: {
+        status: "FAILED",
+        lastError,
       },
     });
     throw error;

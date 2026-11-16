@@ -4,7 +4,7 @@ import { headers } from "next/headers";
 import { prisma } from "@/server/db/client";
 import { ConflictError, ValidationFailedError, isUniqueViolation } from "@/server/db/errors";
 import { writeAudit } from "@/server/audit/log";
-import { appUrl, sendEmail } from "@/server/notifications/mailer";
+import { appUrl, escapeHtml, sendEmail } from "@/server/notifications/mailer";
 import { isSlugAvailable } from "@/server/tenancy/resolve";
 import { newOpaqueToken, tokenFingerprint } from "./tokens";
 import { hashPassword, needsRehash, verifyPassword } from "./password";
@@ -41,9 +41,15 @@ const TRIAL_DAYS = 14;
 
 async function requestMeta(): Promise<{ ip: string | null; userAgent: string | null }> {
   const h = await headers();
-  const forwarded = h.get("x-forwarded-for");
+  const realIp = h.get("x-real-ip")?.trim() || h.get("cf-connecting-ip")?.trim();
+  const forwardedIp = h
+    .get("x-forwarded-for")
+    ?.split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .pop();
   return {
-    ip: forwarded?.split(",")[0]?.trim() ?? h.get("x-real-ip") ?? null,
+    ip: realIp || forwardedIp || null,
     userAgent: h.get("user-agent"),
   };
 }
@@ -312,7 +318,7 @@ export async function requestPasswordReset(input: unknown): Promise<ActionResult
         to: email,
         subject: "Reset your password",
         text: `Hi ${user.name}, reset your password: ${link} (valid for 1 hour). Ignore this if you did not ask.`,
-        html: `<p>Hi ${user.name},</p><p><a href="${link}">Reset your password</a> — valid for 1 hour.</p><p>If you didn't request this, ignore this email.</p>`,
+        html: `<p>Hi ${escapeHtml(user.name)},</p><p><a href="${escapeHtml(link)}">Reset your password</a> — valid for 1 hour.</p><p>If you didn't request this, ignore this email.</p>`,
       });
     }
     // Always the same answer, whether or not the account exists.
@@ -323,12 +329,14 @@ export async function requestPasswordReset(input: unknown): Promise<ActionResult
 export async function resetPassword(input: unknown): Promise<ActionResult<{ redirectTo: string }>> {
   return runAction(async () => {
     const data = resetPasswordSchema.parse(input);
-    const row = await prisma.verificationToken.findUnique({
-      where: { tokenHash: tokenFingerprint(data.token) },
+    const row = await prisma.verificationToken.findFirst({
+      where: {
+        tokenHash: tokenFingerprint(data.token),
+        purpose: { in: ["PASSWORD_RESET", "STAFF_INVITE"] },
+      },
     });
     if (
       !row ||
-      row.purpose !== "PASSWORD_RESET" ||
       row.consumedAt ||
       row.expiresAt <= new Date() ||
       !row.userId

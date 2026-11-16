@@ -32,7 +32,22 @@ export const removeStaffSchema = z.object({
 
 export const gymSettingsInputSchema = z.object({
   name: z.string().trim().min(2, "Enter your gym's name.").max(80, "Name is too long."),
-  timezone: z.string().trim().min(1, "Enter a valid timezone.").max(64, "Timezone is too long."),
+  timezone: z
+    .string()
+    .trim()
+    .min(1, "Enter a valid timezone.")
+    .max(64, "Timezone is too long.")
+    .refine(
+      (tz) => {
+        try {
+          Intl.DateTimeFormat(undefined, { timeZone: tz });
+          return true;
+        } catch {
+          return false;
+        }
+      },
+      "Enter a valid IANA timezone (e.g. Asia/Kolkata).",
+    ),
   currency: z
     .string()
     .trim()

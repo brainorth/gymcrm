@@ -2,7 +2,7 @@ import { auditInContext } from "@/server/audit/log";
 import type { TenantContext } from "@/server/auth/rbac";
 import { newOpaqueToken, tokenFingerprint } from "@/server/auth/tokens";
 import { prisma } from "@/server/db/client";
-import { ConflictError, NotFoundError, ValidationFailedError } from "@/server/db/errors";
+import { ForbiddenError, NotFoundError, ValidationFailedError } from "@/server/db/errors";
 import { appUrl, sendEmail } from "@/server/notifications/mailer";
 import type {
   GymSettingsParsedInput,
@@ -29,6 +29,40 @@ export type GymSettingsDTO = {
 };
 
 const INVITE_TTL_MS = 7 * 86_400_000;
+
+function escapeHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&#39;");
+}
+
+async function getGymOwnerId(gymId: string): Promise<string> {
+  const gym = await prisma.gym.findUnique({
+    where: { id: gymId },
+    select: { ownerId: true },
+  });
+  if (!gym) throw new NotFoundError("Gym");
+  return gym.ownerId;
+}
+
+async function sendStaffInviteEmail(
+  user: { name: string; email: string },
+  gymName: string,
+  role: StaffRole,
+  rawToken: string,
+): Promise<void> {
+  const inviteUrl = appUrl(`/reset-password?token=${rawToken}`);
+  const roleLabel = role.replace("_", " ");
+  await sendEmail({
+    to: user.email,
+    subject: `You're invited to ${gymName}`,
+    text: `Hi ${user.name}, you have been invited to join ${gymName} as ${roleLabel}. Set your password to get started: ${inviteUrl}`,
+    html: `<p>Hi ${escapeHtml(user.name)},</p><p>You have been invited to join <strong>${escapeHtml(gymName)}</strong> as <strong>${escapeHtml(roleLabel)}</strong>.</p><p><a href="${escapeHtml(inviteUrl)}">Accept invite and set your password</a></p>`,
+  });
+}
 
 const MEMBERSHIP_SELECT = {
   id: true,
@@ -90,6 +124,11 @@ export async function addOrInviteStaff(
   ctx: TenantContext,
   input: InviteStaffParsedInput,
 ): Promise<{ staff: StaffDTO; invited: boolean }> {
+  const ownerId = await getGymOwnerId(ctx.gym.id);
+  if (input.role === "GYM_OWNER" && ctx.user.id !== ownerId && ctx.role !== "SUPER_ADMIN") {
+    throw new ForbiddenError("Only the primary gym owner can assign the owner role.");
+  }
+
   const existingUser = await prisma.user.findUnique({
     where: { email: input.email },
     select: { id: true, name: true, email: true },
@@ -101,29 +140,48 @@ export async function addOrInviteStaff(
       select: MEMBERSHIP_SELECT,
     })) as unknown as MembershipRow | null;
 
-    if (existingMembership && existingMembership.role !== "MEMBER") {
-      throw new ConflictError("This user is already a staff member at this gym.");
+    if (existingMembership && existingMembership.role !== "MEMBER" && existingMembership.isActive) {
+      throw new ValidationFailedError("This user is already on your staff.");
     }
 
-    const membership = existingMembership
-      ? ((await ctx.db.gymMembership.update({
-          where: { id: existingMembership.id },
-          data: {
-            role: input.role,
-            isActive: true,
-            invitedBy: ctx.user.id,
-          },
-          select: MEMBERSHIP_SELECT,
-        })) as unknown as MembershipRow)
-      : ((await ctx.db.gymMembership.create({
-          // tenantDb injects gymId at runtime
-          data: {
-            userId: existingUser.id,
-            role: input.role,
-            invitedBy: ctx.user.id,
-          } as never,
-          select: MEMBERSHIP_SELECT,
-        })) as unknown as MembershipRow);
+    const rawToken = newOpaqueToken();
+    const membership = await prisma.$transaction(async (tx) => {
+      const m = existingMembership
+        ? await tx.gymMembership.update({
+            where: { id: existingMembership.id },
+            data: {
+              role: input.role,
+              isActive: false,
+              invitedBy: ctx.user.id,
+            },
+            select: MEMBERSHIP_SELECT,
+          })
+        : await tx.gymMembership.create({
+            data: {
+              userId: existingUser.id,
+              gymId: ctx.gym.id,
+              role: input.role,
+              isActive: false,
+              invitedBy: ctx.user.id,
+            },
+            select: MEMBERSHIP_SELECT,
+          });
+
+      await tx.verificationToken.create({
+        data: {
+          purpose: "STAFF_INVITE",
+          tokenHash: tokenFingerprint(rawToken),
+          email: existingUser.email,
+          userId: existingUser.id,
+          gymId: ctx.gym.id,
+          expiresAt: new Date(Date.now() + INVITE_TTL_MS),
+        },
+      });
+
+      return m as unknown as MembershipRow;
+    });
+
+    await sendStaffInviteEmail(existingUser, ctx.gym.name, input.role, rawToken);
 
     const staff = toStaffDTO(membership, existingUser);
     await auditInContext({
@@ -134,10 +192,10 @@ export async function addOrInviteStaff(
         userId: existingUser.id,
         email: existingUser.email,
         role: input.role,
-        invited: false,
+        invited: true,
       },
     });
-    return { staff, invited: false };
+    return { staff, invited: true };
   }
 
   const rawToken = newOpaqueToken();
@@ -175,13 +233,7 @@ export async function addOrInviteStaff(
     return { user, membership };
   });
 
-  const link = appUrl(`/reset-password?token=${rawToken}`);
-  await sendEmail({
-    to: created.user.email,
-    subject: `You're invited to ${ctx.gym.name}`,
-    text: `Hi ${created.user.name}, you have been invited to join ${ctx.gym.name} as ${input.role.replace("_", " ")}. Set your password to get started: ${link}`,
-    html: `<p>Hi ${created.user.name},</p><p>You have been invited to join <strong>${ctx.gym.name}</strong> as <strong>${input.role.replace("_", " ")}</strong>.</p><p><a href="${link}">Accept invite and set your password</a></p>`,
-  });
+  await sendStaffInviteEmail(created.user, ctx.gym.name, input.role, rawToken);
 
   const staff = toStaffDTO(created.membership, created.user);
   await auditInContext({
@@ -209,6 +261,11 @@ export async function updateStaffRole(
     select: MEMBERSHIP_SELECT,
   })) as unknown as MembershipRow | null;
   if (!existing) throw new NotFoundError("Staff member");
+
+  const ownerId = await getGymOwnerId(ctx.gym.id);
+  if (existing.userId === ownerId && ctx.user.id !== ownerId) {
+    throw new ForbiddenError("Only the primary gym owner can change their own role.");
+  }
 
   if (existing.userId === ctx.user.id && existing.role === "GYM_OWNER" && role !== "GYM_OWNER") {
     const ownerCount = await ctx.db.gymMembership.count({
@@ -253,6 +310,11 @@ export async function removeStaff(
     select: MEMBERSHIP_SELECT,
   })) as unknown as MembershipRow | null;
   if (!existing) throw new NotFoundError("Staff member");
+
+  const ownerId = await getGymOwnerId(ctx.gym.id);
+  if (existing.userId === ownerId && ctx.user.id !== ownerId) {
+    throw new ForbiddenError("The primary gym owner cannot be removed.");
+  }
 
   if (existing.userId === ctx.user.id) {
     throw new ValidationFailedError("You cannot remove your own staff access.");

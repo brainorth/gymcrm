@@ -20,8 +20,83 @@ const CONTENT_TYPE_BY_EXT: Record<string, string> = {
   webp: "image/webp",
   gif: "image/gif",
   pdf: "application/pdf",
-  svg: "image/svg+xml",
 };
+
+const EXT_BY_MIME: Record<string, string> = {
+  "image/jpeg": "jpg",
+  "image/png": "png",
+  "image/webp": "webp",
+  "image/gif": "gif",
+  "application/pdf": "pdf",
+};
+
+const ALLOWED_MIME_TYPES = new Set(Object.keys(EXT_BY_MIME));
+
+function matchesMagicBytes(mimeType: string, bytes: Uint8Array): boolean {
+  switch (mimeType) {
+    case "image/jpeg":
+      return bytes.length >= 3 && bytes[0] === 0xff && bytes[1] === 0xd8 && bytes[2] === 0xff;
+    case "image/png":
+      return (
+        bytes.length >= 4 &&
+        bytes[0] === 0x89 &&
+        bytes[1] === 0x50 &&
+        bytes[2] === 0x4e &&
+        bytes[3] === 0x47
+      );
+    case "image/gif":
+      return (
+        bytes.length >= 4 &&
+        bytes[0] === 0x47 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x38
+      );
+    case "image/webp":
+      return (
+        bytes.length >= 12 &&
+        bytes[0] === 0x52 &&
+        bytes[1] === 0x49 &&
+        bytes[2] === 0x46 &&
+        bytes[3] === 0x46 &&
+        bytes[8] === 0x57 &&
+        bytes[9] === 0x45 &&
+        bytes[10] === 0x42 &&
+        bytes[11] === 0x50
+      );
+    case "application/pdf":
+      return (
+        bytes.length >= 5 &&
+        bytes[0] === 0x25 &&
+        bytes[1] === 0x50 &&
+        bytes[2] === 0x44 &&
+        bytes[3] === 0x46 &&
+        bytes[4] === 0x2d
+      );
+    default:
+      return false;
+  }
+}
+
+export function validateUploadFile(
+  declaredContentType: string,
+  bytes: Uint8Array,
+): { contentType: string; ext: string } {
+  const normalized = declaredContentType.split(";")[0]?.trim().toLowerCase() ?? "";
+  const ext = EXT_BY_MIME[normalized];
+  if (!ext) {
+    throw new ValidationFailedError(
+      "Unsupported file type. Allowed: JPEG, PNG, WebP, GIF, or PDF.",
+      { file: ["Unsupported file type."] },
+    );
+  }
+  if (!matchesMagicBytes(normalized, bytes)) {
+    throw new ValidationFailedError("File contents do not match the declared file type.", {
+      file: ["File contents do not match the declared type."],
+    });
+  }
+  return { contentType: normalized, ext };
+}
 
 function assertSafeSegment(value: string, label: string): string {
   if (!SAFE_SEGMENT_RE.test(value)) {
@@ -81,7 +156,13 @@ export async function savePrivateFile(input: {
   }
   const gymId = assertSafeSegment(input.gymId, "gymId");
   const memberId = assertSafeSegment(input.memberId, "memberId");
+  const validated = validateUploadFile(input.contentType, input.bytes);
   const ext = normalizeExt(input.ext);
+  if (CONTENT_TYPE_BY_EXT[ext] !== validated.contentType) {
+    throw new ValidationFailedError("File extension does not match the file type.", {
+      file: ["Unsupported file extension."],
+    });
+  }
   const key = `${gymId}/${memberId}/${input.kind}-${randomUUID()}.${ext}`;
 
   const driver = env().STORAGE_DRIVER;
@@ -149,6 +230,10 @@ export async function readPrivateFile(
   }
 
   const bytes = new Uint8Array(await res.arrayBuffer());
-  const contentType = res.headers.get("content-type") || fallbackContentType;
+  const rawContentType = res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase();
+  const contentType =
+    rawContentType && ALLOWED_MIME_TYPES.has(rawContentType)
+      ? rawContentType
+      : fallbackContentType;
   return { bytes, contentType };
 }

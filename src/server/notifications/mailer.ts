@@ -37,6 +37,18 @@ export async function sendEmail(email: Email): Promise<{ delivered: boolean; id?
   return { delivered: true, id: body.id };
 }
 
+const HTML_ESCAPES: Record<string, string> = {
+  "&": "&amp;",
+  "<": "&lt;",
+  ">": "&gt;",
+  '"': "&quot;",
+  "'": "&#39;",
+};
+
+export function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (ch) => HTML_ESCAPES[ch]!);
+}
+
 /** Absolute URL on the app host (used in emails, never relative). */
 export function appUrl(path: string): string {
   const host = process.env.NEXT_PUBLIC_APP_HOST ?? "gym.brainorth.com";

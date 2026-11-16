@@ -6,9 +6,8 @@ export async function POST(req: Request) {
   try {
     const rawBody = await req.text();
     const signature = req.headers.get("x-razorpay-signature") ?? "";
-    const eventIdHeader = req.headers.get("x-razorpay-event-id") ?? undefined;
 
-    const result = await processRazorpayWebhook(rawBody, signature, eventIdHeader);
+    const result = await processRazorpayWebhook(rawBody, signature);
     return NextResponse.json({ ok: true, ...result }, { status: 200 });
   } catch (error) {
     if (error instanceof AppError) {

@@ -93,16 +93,34 @@ export async function checkInMember(
     throw new ValidationFailedError("Archived members cannot check in.");
   }
 
-  // Link to active, non-expired subscription if one exists.
+  // Link to active, non-expired, non-frozen subscription if one exists.
   const activeSub = await ctx.db.memberSubscription.findFirst({
     where: {
       memberId: member.id,
       status: "ACTIVE",
       effectiveEndDate: { gte: today },
+      freezes: { none: { endDate: null } },
     },
     orderBy: { effectiveEndDate: "desc" },
     select: { id: true },
   });
+
+  if (!activeSub) {
+    const frozenSub = await ctx.db.memberSubscription.findFirst({
+      where: {
+        memberId: member.id,
+        status: "ACTIVE",
+        effectiveEndDate: { gte: today },
+        freezes: { some: { endDate: null } },
+      },
+      select: { id: true },
+    });
+    if (frozenSub) {
+      throw new ValidationFailedError(
+        "This membership is currently frozen. Resume it before checking in.",
+      );
+    }
+  }
 
   try {
     const created = (await ctx.db.attendance.create({

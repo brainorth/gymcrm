@@ -12,7 +12,7 @@ import { createSession, setSessionCookie } from "@/server/auth/session";
 import { newOpaqueToken, tokenFingerprint } from "@/server/auth/tokens";
 import { prisma } from "@/server/db/client";
 import { ConflictError, NotFoundError, ValidationFailedError } from "@/server/db/errors";
-import { appUrl, sendEmail } from "@/server/notifications/mailer";
+import { appUrl, escapeHtml, sendEmail } from "@/server/notifications/mailer";
 
 const INVITE_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 days
 
@@ -33,9 +33,15 @@ type InvitePayload = {
 
 async function requestMeta(): Promise<{ ip: string | null; userAgent: string | null }> {
   const h = await headers();
-  const forwarded = h.get("x-forwarded-for");
+  const realIp = h.get("x-real-ip")?.trim() || h.get("cf-connecting-ip")?.trim();
+  const forwardedIp = h
+    .get("x-forwarded-for")
+    ?.split(",")
+    .map((part) => part.trim())
+    .filter(Boolean)
+    .pop();
   return {
-    ip: forwarded?.split(",")[0]?.trim() || h.get("x-real-ip") || null,
+    ip: realIp || forwardedIp || null,
     userAgent: h.get("user-agent") || null,
   };
 }
@@ -95,7 +101,7 @@ export async function inviteMemberAction(
         to: email,
         subject: `Claim your ${ctx.gym.name} member portal`,
         text: `Hi ${member.fullName}, claim your ${ctx.gym.name} member account: ${link} (valid for 7 days).`,
-        html: `<p>Hi ${member.fullName},</p><p>You've been invited to the <strong>${ctx.gym.name}</strong> member portal.</p><p><a href="${link}">Set your password and claim your account</a> — this link is valid for 7 days.</p>`,
+        html: `<p>Hi ${escapeHtml(member.fullName)},</p><p>You've been invited to the <strong>${escapeHtml(ctx.gym.name)}</strong> member portal.</p><p><a href="${escapeHtml(link)}">Set your password and claim your account</a> — this link is valid for 7 days.</p>`,
       });
 
       await auditInContext({
@@ -163,8 +169,11 @@ export async function acceptMemberInviteAction(
 
       const existingUser = await tx.user.findUnique({
         where: { email: row.email },
-        select: { id: true, passwordHash: true, emailVerifiedAt: true },
+        select: { id: true, passwordHash: true, emailVerifiedAt: true, isActive: true },
       });
+      if (existingUser && !existingUser.isActive) {
+        throw new ValidationFailedError("This account has been disabled.");
+      }
 
       const user = existingUser
         ? await tx.user.update({
